@@ -6,7 +6,7 @@ services:
     depends_on:
       - direwolf
     ports:
-      - "14501:14501"
+      - "127.0.0.1:14501:14501"
     environment:
       PROPVIEW_DATA_DIR: /data
       PROPVIEW_HOST: 0.0.0.0

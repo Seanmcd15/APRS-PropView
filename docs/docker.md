@@ -21,6 +21,8 @@ The default compose file stores persistent data in `./data`:
 
 Back up that directory to preserve the full install.
 
+The default Compose files publish port `14501` on `127.0.0.1` only. APRS PropView does not provide web authentication, and its API can export configuration secrets, change settings, delete stored data, and transmit packets. Do not replace the loopback address with `0.0.0.0` unless a firewall or private VPN restricts access to trusted clients.
+
 ## Image
 
 Published release images are intended to use:
@@ -62,6 +64,8 @@ variable such as `PROPVIEW_HOST`, `PROPVIEW_PORT`, `PROPVIEW_CALLSIGN`, or
 `PROPVIEW_KISS_TCP_HOST` in TrueNAS, Portainer, or Compose, that value wins over
 what is saved in the web UI after the next restart. For settings you want to
 manage from PropView itself, leave the matching environment variable unset.
+
+Relative `PROPVIEW_DB` values and relative database paths in `config.toml` are resolved beneath `PROPVIEW_DATA_DIR` so custom database filenames remain on persistent storage.
 
 ## RF Input
 
