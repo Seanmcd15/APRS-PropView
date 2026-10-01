@@ -83,6 +83,17 @@ class SettingsImpactTests(unittest.TestCase):
             self.assertAlmostEqual(config.station.latitude, 35.25)
             self.assertAlmostEqual(config.station.longitude, -80.5)
 
+    def test_relative_database_path_uses_container_data_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            config = Config()
+            config.database.path = "archive.db"
+
+            with patch.dict("os.environ", {}, clear=True):
+                _apply_env_overrides(config, data_dir)
+
+            self.assertEqual(config.database.path, str(data_dir / "archive.db"))
+
     def test_launch_browser_none_is_valid_and_disables_open(self):
         self.assertIsNone(_validate_config({"web": {"launch_browser": "none"}}))
         self.assertIn({"id": "none", "name": "Do not open automatically"}, available_browsers())

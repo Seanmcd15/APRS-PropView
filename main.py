@@ -134,9 +134,15 @@ def _apply_env_overrides(config: Config, data_dir: Path | None) -> None:
 
     db_path = _env_value("PROPVIEW_DB")
     if db_path:
-        config.database.path = str(Path(db_path).expanduser())
-    elif data_dir and config.database.path == "propview.db":
-        config.database.path = str(data_dir / "propview.db")
+        configured_db_path = Path(db_path).expanduser()
+        if data_dir and not configured_db_path.is_absolute():
+            configured_db_path = data_dir / configured_db_path
+        config.database.path = str(configured_db_path)
+    elif data_dir:
+        configured_db_path = Path(config.database.path).expanduser()
+        if not configured_db_path.is_absolute():
+            configured_db_path = data_dir / configured_db_path
+        config.database.path = str(configured_db_path)
 
     update_checks = _env_bool("PROPVIEW_UPDATE_CHECKS")
     if update_checks is not None:

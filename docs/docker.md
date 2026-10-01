@@ -63,6 +63,8 @@ variable such as `PROPVIEW_HOST`, `PROPVIEW_PORT`, `PROPVIEW_CALLSIGN`, or
 what is saved in the web UI after the next restart. For settings you want to
 manage from PropView itself, leave the matching environment variable unset.
 
+Relative `PROPVIEW_DB` values and relative database paths in `config.toml` are resolved beneath `PROPVIEW_DATA_DIR` so custom database filenames remain on persistent storage.
+
 ## RF Input
 
 For containers, TCP KISS is the smoothest setup. A common pattern is Direwolf on
