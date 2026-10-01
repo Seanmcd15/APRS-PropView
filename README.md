@@ -208,6 +208,8 @@ and other registry-style installs, use `ghcr.io/rf-yvy/aprs-propview:latest`
 and mount persistent storage at `/data`. See [docs/docker.md](docs/docker.md)
 for TCP KISS, USB serial passthrough, and TrueNAS SCALE settings.
 
+The default Compose files publish the web UI on `127.0.0.1` only. APRS PropView does not provide web authentication, and its API can change settings and transmit packets. Only publish the port on a LAN address when access is restricted to a trusted private network or VPN.
+
 ### Run From Source On macOS
 
 Install Python 3.11 or newer, then run APRS PropView from a terminal:

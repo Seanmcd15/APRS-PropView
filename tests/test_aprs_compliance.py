@@ -94,6 +94,17 @@ class SettingsImpactTests(unittest.TestCase):
 
             self.assertEqual(config.database.path, str(data_dir / "archive.db"))
 
+    def test_default_compose_files_publish_ui_on_loopback_only(self):
+        project_root = Path(__file__).resolve().parents[1]
+        for relative_path in (
+            "docker-compose.yml",
+            "deploy/docker/docker-compose.direwolf.yml",
+        ):
+            with self.subTest(relative_path=relative_path):
+                compose = (project_root / relative_path).read_text(encoding="utf-8")
+                self.assertIn('"127.0.0.1:14501:14501"', compose)
+                self.assertNotIn('"14501:14501"', compose)
+
     def test_launch_browser_none_is_valid_and_disables_open(self):
         self.assertIsNone(_validate_config({"web": {"launch_browser": "none"}}))
         self.assertIn({"id": "none", "name": "Do not open automatically"}, available_browsers())
