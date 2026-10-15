@@ -4,6 +4,7 @@ import json
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlparse
 
 import server.analytics as analytics_module
 from server.aprs_is import APRSISClient
@@ -12,7 +13,11 @@ from server.app import (
     _is_valid_message_addressee,
     _is_valid_station_callsign,
     _container_env_override_warnings,
+    _download_tile,
+    _fetch_public_tile_data,
+    _is_public_tile_url,
     _merge_secret_value,
+    _open_pinned_tile_connection,
     _rf_ports_signature,
     _tile_cache_key,
     _tile_cache_path,
@@ -600,6 +605,130 @@ qrz_password = "qrzsecret"
 
         self.assertNotEqual(_tile_cache_key(osm), _tile_cache_key(local))
         self.assertNotEqual(_tile_cache_path(osm, 5, 8, 12), _tile_cache_path(local, 5, 8, 12))
+
+    def test_custom_map_tiles_reject_non_public_destinations(self):
+        for host in ("127.0.0.1", "169.254.169.254", "10.0.0.1", "[::1]"):
+            with self.subTest(host=host):
+                error = _validate_config({
+                    "web": {
+                        "map_tile_source": "custom",
+                        "map_tile_url": f"http://{host}/{{z}}/{{x}}/{{y}}.png",
+                    },
+                })
+
+                self.assertEqual(error, "Custom map tile URL must resolve to public addresses.")
+
+    @patch("server.app.socket.getaddrinfo")
+    def test_custom_map_tiles_reject_hostnames_resolving_to_private_addresses(self, getaddrinfo):
+        getaddrinfo.return_value = [
+            (2, 1, 6, "", ("192.168.1.20", 443)),
+        ]
+
+        self.assertFalse(_is_public_tile_url("https://tiles.example/{z}/{x}/{y}.png"))
+
+    @patch("server.app._open_pinned_tile_connection")
+    @patch("server.app.socket.getaddrinfo")
+    def test_tile_download_rechecks_destination_before_fetch(self, getaddrinfo, open_connection):
+        getaddrinfo.return_value = [
+            (2, 1, 6, "", ("10.0.0.5", 80)),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp, patch("server.app.MAP_TILE_CACHE_DIR", Path(tmp)):
+            result = _download_tile("http://internal.example/{z}/{x}/{y}.png", 1, 0, 0)
+
+        self.assertIsNone(result)
+        open_connection.assert_not_called()
+
+    def test_tile_download_does_not_serve_cached_private_responses(self):
+        tile_url = "http://169.254.169.254/latest/{z}/{x}/{y}.png"
+
+        with tempfile.TemporaryDirectory() as tmp, patch("server.app.MAP_TILE_CACHE_DIR", Path(tmp)):
+            cached = _tile_cache_path(tile_url, 1, 0, 0)
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(b"sensitive metadata")
+
+            result = _download_tile(tile_url, 1, 0, 0)
+
+        self.assertIsNone(result)
+
+    @patch("server.app.socket.getaddrinfo", side_effect=OSError)
+    def test_default_tile_cache_remains_available_offline(self, _getaddrinfo):
+        tile_url = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+
+        with tempfile.TemporaryDirectory() as tmp, patch("server.app.MAP_TILE_CACHE_DIR", Path(tmp)):
+            cached = _tile_cache_path(tile_url, 1, 0, 0)
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(b"cached tile")
+
+            result = _download_tile(tile_url, 1, 0, 0)
+
+        self.assertEqual(result, cached)
+
+    @patch("server.app._fetch_public_tile_data", return_value=None)
+    def test_legacy_custom_cache_is_not_promoted_from_current_dns(self, fetch):
+        tile_url = "https://tiles.example/{z}/{x}/{y}.png"
+
+        with tempfile.TemporaryDirectory() as tmp, patch("server.app.MAP_TILE_CACHE_DIR", Path(tmp)):
+            cached = _tile_cache_path(tile_url, 1, 0, 0)
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(b"sensitive legacy response")
+
+            result = _download_tile(tile_url, 1, 0, 0)
+
+        self.assertIsNone(result)
+        fetch.assert_called_once()
+
+    @patch("server.app._fetch_public_tile_data", side_effect=OSError)
+    def test_tile_download_handles_upstream_connection_errors(self, _fetch):
+        with tempfile.TemporaryDirectory() as tmp, patch("server.app.MAP_TILE_CACHE_DIR", Path(tmp)):
+            result = _download_tile("https://tiles.example/{z}/{x}/{y}.png", 1, 0, 0)
+
+        self.assertIsNone(result)
+
+    @patch("server.app._open_pinned_tile_connection")
+    @patch("server.app.socket.getaddrinfo")
+    def test_tile_redirects_reject_non_public_destinations(self, getaddrinfo, open_connection):
+        class RedirectResponse:
+            status = 302
+
+            @staticmethod
+            def getheader(name):
+                return "http://169.254.169.254/latest/meta-data/" if name == "Location" else None
+
+        class RedirectConnection:
+            def request(self, *_args, **_kwargs):
+                pass
+
+            def getresponse(self):
+                return RedirectResponse()
+
+            def close(self):
+                pass
+
+        getaddrinfo.return_value = [
+            (2, 1, 6, "", ("8.8.8.8", 443)),
+        ]
+        open_connection.return_value = RedirectConnection()
+
+        result = _fetch_public_tile_data("https://tiles.example/0/0/0.png")
+
+        self.assertIsNone(result)
+        open_connection.assert_called_once()
+
+    @patch("server.app.socket.create_connection")
+    def test_pinned_connection_uses_validated_ip(self, create_connection):
+        sock = create_connection.return_value
+        connection = _open_pinned_tile_connection(
+            urlparse("http://tiles.example/0/0/0.png"),
+            80,
+            "8.8.8.8",
+            10,
+        )
+
+        connection.connect()
+
+        create_connection.assert_called_once_with(("8.8.8.8", 80), 10, None)
+        sock.setsockopt.assert_called_once()
 
     def test_tile_coords_for_current_view_bounds(self):
         coords = _tile_coords_for_bounds(
