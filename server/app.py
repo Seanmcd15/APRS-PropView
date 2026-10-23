@@ -4,10 +4,13 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import http.client
+import ipaddress
 import mimetypes
 import os
 import re
 import shutil
+import socket
 import subprocess
 import time
 import logging
@@ -258,6 +261,18 @@ def _tile_cache_path(tile_url: str, z: int, x: int, y: int) -> Path:
     return MAP_TILE_CACHE_DIR / _tile_cache_key(tile_url) / str(z) / str(x) / f"{y}{suffix}"
 
 
+def _tile_cache_validation_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".public")
+
+
+def _is_trusted_cached_tile(tile_url: str, path: Path) -> bool:
+    return (
+        path.exists()
+        and path.stat().st_size > 0
+        and (tile_url == _default_tile_url() or _tile_cache_validation_path(path).exists())
+    )
+
+
 def _tile_url_for(tile_url: str, z: int, x: int, y: int) -> str:
     subdomains = "abc"
     subdomain = subdomains[(x + y) % len(subdomains)]
@@ -270,34 +285,116 @@ def _tile_url_for(tile_url: str, z: int, x: int, y: int) -> str:
     )
 
 
+def _resolve_public_tile_url(url: str):
+    try:
+        parsed = urllib.parse.urlparse(url)
+        hostname = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not hostname or parsed.username or parsed.password:
+        return None
+
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        return (parsed, port, (str(literal),)) if literal.is_global else None
+
+    try:
+        resolved = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        addresses = tuple(dict.fromkeys(address[4][0] for address in resolved))
+        if not addresses or not all(ipaddress.ip_address(address).is_global for address in addresses):
+            return None
+    except (OSError, ValueError):
+        return None
+    return parsed, port, addresses
+
+
+def _is_public_tile_url(url: str) -> bool:
+    return _resolve_public_tile_url(url) is not None
+
+
+def _open_pinned_tile_connection(parsed, port: int, address: str, timeout: int):
+    connection_class = (
+        http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    )
+    connection = connection_class(parsed.hostname, port, timeout=timeout)
+
+    def create_connection(_destination, connect_timeout, source_address):
+        return socket.create_connection((address, port), connect_timeout, source_address)
+
+    connection._create_connection = create_connection
+    return connection
+
+
+def _fetch_public_tile_data(url: str, timeout: int = 10, max_redirects: int = 5) -> Optional[bytes]:
+    current_url = url
+    for _redirect_count in range(max_redirects + 1):
+        destination = _resolve_public_tile_url(current_url)
+        if destination is None:
+            return None
+        parsed, port, addresses = destination
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+
+        response = None
+        connection = None
+        for address in addresses:
+            connection = _open_pinned_tile_connection(parsed, port, address, timeout)
+            try:
+                connection.request(
+                    "GET",
+                    target,
+                    headers={
+                        "User-Agent": "APRSPropView tile-cache",
+                        "Referer": "http://localhost/",
+                        "Connection": "close",
+                    },
+                )
+                response = connection.getresponse()
+                break
+            except (OSError, http.client.HTTPException):
+                connection.close()
+                connection = None
+
+        if response is None or connection is None:
+            return None
+        try:
+            if response.status in {301, 302, 303, 307, 308}:
+                location = response.getheader("Location")
+                if not location:
+                    return None
+                current_url = urllib.parse.urljoin(current_url, location)
+                continue
+            if response.status >= 400:
+                return None
+            return response.read(1024 * 1024)
+        finally:
+            connection.close()
+    return None
+
+
 def _download_tile(tile_url: str, z: int, x: int, y: int) -> Optional[Path]:
     path = _tile_cache_path(tile_url, z, x, y)
-    if path.exists() and path.stat().st_size > 0:
+    if _is_trusted_cached_tile(tile_url, path):
         return path
 
     url = _tile_url_for(tile_url, z, x, y)
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "APRSPropView tile-cache",
-            "Referer": "http://localhost/",
-        },
-    )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            status = getattr(resp, "status", 200)
-            if status >= 400:
-                return None
-            data = resp.read(1024 * 1024)
+        data = _fetch_public_tile_data(url)
     except Exception:
         return None
-
     if not data:
         return None
+
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_bytes(data)
     tmp.replace(path)
+    _tile_cache_validation_path(path).touch()
     return path
 
 
@@ -610,6 +707,8 @@ def _validate_config(body: Dict[str, Any]) -> Optional[str]:
             parsed = urllib.parse.urlparse(tile_url)
             if parsed.scheme not in {"http", "https"}:
                 return "Custom map tile URL must start with http:// or https://."
+            if not _is_public_tile_url(_tile_url_for(tile_url, 0, 0, 0)):
+                return "Custom map tile URL must resolve to public addresses."
             try:
                 max_zoom = int(w.get("map_tile_max_zoom", 19))
                 if max_zoom < 1 or max_zoom > 22:
@@ -924,9 +1023,7 @@ def create_app(
 
         tile_cfg = _tile_source_config(config)
         tile_url = tile_cfg["url"]
-        path = _tile_cache_path(tile_url, z, x, y)
-        if not path.exists() or path.stat().st_size <= 0:
-            path = await asyncio.to_thread(_download_tile, tile_url, z, x, y)
+        path = await asyncio.to_thread(_download_tile, tile_url, z, x, y)
         if not path or not path.exists():
             return JSONResponse(status_code=404, content={"success": False, "message": "Tile not cached and upstream is unavailable."})
         media_type = mimetypes.guess_type(path.name)[0] or "image/png"
@@ -940,7 +1037,11 @@ def create_app(
         size_bytes = 0
         if cache_root.exists():
             for path in cache_root.rglob("*"):
-                if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+                if (
+                    path.is_file()
+                    and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+                    and _is_trusted_cached_tile(tile_cfg["url"], path)
+                ):
                     count += 1
                     size_bytes += path.stat().st_size
         return {
@@ -991,7 +1092,7 @@ def create_app(
             nonlocal downloaded, cached, failed
             z, x, y = coord
             path = _tile_cache_path(tile_url, z, x, y)
-            if path.exists() and path.stat().st_size > 0:
+            if _is_trusted_cached_tile(tile_url, path):
                 cached += 1
                 return
             async with semaphore:
